@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wizards’ Duel Arena</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel&display=swap" rel="stylesheet">
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: 'Cinzel', serif;
+            background-color: #0d0d1a;
+            margin: 0;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+        }
+        #lobby {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(0, 0, 0, 0.7);
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+        }
+        #nameInput, #joinButton {
+            padding: 10px;
+            font-size: 18px;
+            border-radius: 5px;
+            margin: 5px;
+        }
+        #joinButton {
+            background-color: gold;
+            border: none;
+            cursor: pointer;
+        }
+        #globalLeaderboard {
+            margin-top: 20px;
+            color: white;
+        }
+        #deathScreen, #countdown, #reconnectOverlay {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 36px;
+            background-color: rgba(0, 0, 0, 0.8);
+            display: none;
+        }
+        #deathScreen h1, #countdown h1 {
+            margin-bottom: 20px;
+        }
+        #respawnBtn, #lobbyBtn {
+            padding: 10px;
+            font-size: 18px;
+            border-radius: 5px;
+            margin: 5px;
+            background-color: gold;
+            border: none;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div style="position:fixed;top:0;left:0;right:0;background:#ff6b35;color:white;text-align:center;padding:6px;font-size:13px;z-index:9999;">🎮 Demo client — deploy server.js on Railway/Render for full multiplayer. <a href="https://github.com/caytec/wizards-duel-arena" style="color:white">Get server code →</a></div>
+    <canvas id="gameCanvas"></canvas>
+    <div id="lobby">
+        <h1>Wizards’ Duel Arena</h1>
+        <input type="text" id="nameInput" placeholder="Enter your wizard name" />
+        <button id="joinButton">Join Game</button>
+        <div id="globalLeaderboard"></div>
+    </div>
+    <div id="deathScreen">
+        <h1>YOU DIED</h1>
+        <p id="finalScoreText"></p>
+        <p id="bestScoreText"></p>
+        <button id="respawnBtn">Respawn</button>
+        <button id="lobbyBtn">Return to Lobby</button>
+    </div>
+    <div id="countdown">
+        <h1 id="countdownText">3</h1>
+    </div>
+    <div id="reconnectOverlay">
+        <h1>Reconnecting...</h1>
+    </div>
+
+    <script>
+        let gameState = 'lobby';
+        const SERVER_URL = window.location.hostname === 'localhost' ? 'http://localhost:3000' : '';
+        const socket = io(SERVER_URL);
+        let playerId = null;
+        let roomId = null;
+        let playerProfile = { level: 1, xp: 0, allTimeScore: 0 };
+        let predictedX = 1500;
+        let predictedY = 1500;
+        let playerHp = 100;
+        let playerMaxHp = 100;
+        let playerScore = 0;
+        let playerXp = 0;
+        let playerLevel = 1;
+        let ping = 0;
+        let pingStart = 0;
+        let gameTimer = 600;
+        let leaderboard = [];
+        let particles = [];
+        const SPEED = 4;
+        const WORLD_W = 3000;
+        const WORLD_H = 3000;
+        const remoteEntities = new Map();
+        const serverBots = [];
+        const serverCollectibles = [];
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                this.vx = Math.random() * 6 - 3;
+                this.vy = Math.random() * 6 - 3;
+                this.life = 60;
+                this.maxLife = 60;
+                this.size = Math.random() * 4 + 2;
+            }
+
+            spawnParticles() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.life--;
+            }
+
+            updateParticles() {
+                return this.life > 0;
+            }
+
+            drawParticles() {
+                const alpha = this.life / this.maxLife;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(${this.color.r}, ${this.color.g}, ${this.color.b}, ${alpha})`;
+                ctx.fill();
+            }
+        }
+
+        const cam = { x: 0, y: 0 };
+
+        function updateCamera() {
+            cam.x = Math.max(0, Math.min(WORLD_W, predictedX - canvas.width / 2));
+            cam.y = Math.max(0, Math.min(WORLD_H, predictedY - canvas.height / 2));
+        }
+
+        function updateInterpolation() {
+            remoteEntities.forEach(entity => {
+                entity.renderX += (entity.x - entity.renderX) * 0.2;
+                entity.renderY += (entity.y - entity.renderY) * 0.2;
+            });
+        }
+
+        socket.on('connect', () => {
+            socket.emit('requestLeaderboard');
+        });
+
+        socket.on('roomJoined', (data) => {
+            playerId = data.playerId;
+            roomId = data.roomId;
+            playerProfile = data.playerProfile;
+            hideLobby();
+            startCountdown();
+        });
+
+        function hideLobby() {
+            document.getElementById('lobby').style.display = 'none';
+        }
+
+        socket.on('gameState', (state) => {
+            // Handle game state updates...
+        });
+
+        socket.on('playerDied', (data) => {
+            if (data.playerID === playerId) {
+                spawnParticles(predictedX, predictedY, {r: 255, g: 0, b: 0});
+                document.getElementById('deathScreen').style.display = 'flex';
+                document.getElementById('finalScoreText').innerText = `Score: ${playerScore}`;
+                document.getElementById('bestScoreText').innerText = `Best Score: ${playerProfile.allTimeScore}`;
+            }
+        });
+
+        function updatePrediction() {
+            if (gameState === 'playing') {
+                let dx = 0;
+                let dy = 0;
+
+                if (keys['w']) dy = -1; // Move up
+                if (keys['s']) dy = 1;  // Move down
+                if (keys['a']) dx = -1; // Move left
+                if (keys['d']) dx = 1;  // Move right
+
+                // Normalize to range [-1, 1]
+                const length = Math.sqrt(dx * dx + dy * dy);
+                if (length !== 0) {
+                    dx /= length;
+                    dy /= length;
+                }
+
+                predictedX = Math.max(0, Math.min(WORLD_W, predictedX + dx * SPEED));
+                predictedY = Math.max(0, Math.min(WORLD_H, predictedY + dy * SPEED));
+                
+                // Emit input to server
+                if (dx !== 0 || dy !== 0) {
+                    const action = mouse.down ? "attack" : (mouse.rightDown ? "special" : null);
+                    socket.emit('playerInput', { dx, dy, action });
+                }
+
+                emitPing();
+            }
+        }
+
+        function emitPing() {
+            pingStart = Date.now();
+            socket.emit('ping');
+        }
+
+        socket.on('pong', () => {
+            ping = Date.now() - pingStart;
+        });
+
+        function startCountdown() {
+            gameState = 'countdown';
+            document.getElementById('countdown').style.display = 'flex';
+            let countdownStep = 3;
+
+            const countdownInterval = setInterval(() => {
+                if (countdownStep > 0) {
+                    document.getElementById('countdownText').innerText = countdownStep;
+                    countdownStep--;
+                } else {
+                    document.getElementById('countdownText').innerText = 'GO';
+                    clearInterval(countdownInterval);
+                    setTimeout(() => {
+                        document.getElementById('countdown').style.display = 'none';
+                        gameState = 'playing';
+                    }, 1000);
+                }
+            }, 1000);
+        }
+
+        function drawWorld() {
+            ctx.save();
+            ctx.translate(-cam.x, -cam.y);
+            
+            // Fog-of-war effect
+            const gradient = ctx.createRadialGradient(predictedX, predictedY, 0, predictedX, predictedY, WORLD_W);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 0.5)');
+            gradient.addColorStop(1, 'rgba(0, 0, 0, 0.8)');
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+            
+            // Draw collectibles
+            serverCollectibles.forEach(collectible => {
+                ctx.shadowBlur = Math.sin(Date.now() / 500) * 10 + 5;
+                ctx.drawImage(collectibleImage, collectible.x, collectible.y);
+            });
+
+            ctx.restore();
+        }
+
+        function drawHUD() {
+            ctx.fillStyle = '#00ff00'; // Green for HP
+            ctx.fillRect(20, 20, (playerHp / playerMaxHp) * 200, 16);
+            ctx.fillStyle = 'white';
+            ctx.fillText(`Level: ${playerLevel}`, 20, 62);
+            ctx.fillText(`Score: ${playerScore}`, 20, 80);
+            ctx.fillText(`Ping: ${ping}ms`, canvas.width - 100, 20);
+            ctx.fillText(`Timer: ${Math.floor(gameTimer / 20)}`, canvas.width / 2 - 40, 20);
+            // Draw more HUD elements
+        }
+
+        function gameLoop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear canvas
+            if (gameState === 'playing') {
+                updateCamera();
+                updatePrediction();
+                updateInterpolation();
+                drawWorld();
+                drawHUD();
+            }
+            requestAnimationFrame(gameLoop);
+        }
+
+        document.getElementById('joinButton').addEventListener('click', () => {
+            const username = document.getElementById('nameInput').value;
+            socket.emit('joinRoom', username);
+        });
+
+        document.getElementById('respawnBtn').addEventListener('click', () => {
+            socket.emit('respawn');
+            document.getElementById('deathScreen').style.display = 'none';
+            gameState = 'playing';
+        });
+
+        document.getElementById('lobbyBtn').addEventListener('click', () => {
+            document.getElementById('deathScreen').style.display = 'none';
+            document.getElementById('lobby').style.display = 'block';
+            gameState = 'lobby';
+        });
+
+        window.addEventListener('resize', () => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        });
+
+        const keys = {};
+        window.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+        });
+        window.addEventListener('keyup', (e) => {
+            delete keys[e.key.toLowerCase()];
+        });
+
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
